@@ -1,0 +1,180 @@
+package agent
+
+import (
+	"context"
+	"embed"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
+
+	"github.com/iconidentify/maclab/internal/api"
+)
+
+//go:embed tests/*.sh
+var builtinTests embed.FS
+
+// Builtins lists the tests embedded in the agent: the scripts, and
+// suspend-devices, which is Go.
+func Builtins() []string {
+	ents, _ := builtinTests.ReadDir("tests")
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name()[:len(e.Name())-3])
+	}
+	return append(names, suspendDevicesTest, "mesa-provider")
+}
+
+// guiSessionWait is how long a GUI test waits for the desktop session. The
+// wait counts against the test's timeout but isn't cut short by it, so a GUI
+// test with a shorter timeout can take this long.
+const guiSessionWait = 2 * time.Minute
+
+// testTimeout is how long a test may run before it is killed.
+func testTimeout(t api.TestSpec) time.Duration {
+	if t.TimeoutSec > 0 {
+		return time.Duration(t.TimeoutSec) * time.Second
+	}
+	return 5 * time.Minute
+}
+
+func (l *Linux) RunTest(ctx context.Context, job string, t api.TestSpec, fetch Fetcher, quiet Quieter, outDir string) api.TestResult {
+	res := api.TestResult{Name: t.Name}
+	fail := func(err error) api.TestResult { res.Error = err.Error(); res.ExitCode = -1; return res }
+	if err := l.awaitLabBootLock(ctx); err != nil {
+		return fail(err)
+	}
+	if t.Builtin == "mesa-provider" {
+		return l.runMesaProvider(ctx, job, t, outDir)
+	}
+	if t.Builtin == suspendDevicesTest {
+		return suspendDevices(ctx, t, outDir, l.GUIUser, quiet)
+	}
+
+	if err := t.PayloadError(); err != nil {
+		return fail(err)
+	}
+	script := filepath.Join(l.jobDir(job), "test-"+t.Name+".sh")
+	os.MkdirAll(filepath.Dir(script), 0o755)
+	inDir := filepath.Join(l.jobDir(job), "in-"+t.Name)
+	switch {
+	case t.Identity != nil && (t.Builtin != "" || t.Script != ""):
+		return fail(errors.New("an identity check runs lab-agent's own collector, not a builtin or a script"))
+	case t.Identity != nil:
+		if err := checkIdentity(*t.Identity); err != nil {
+			return fail(err)
+		}
+		if err := os.WriteFile(script, []byte(IdentityScript(*t.Identity, true)), 0o755); err != nil {
+			return fail(err)
+		}
+	case t.Builtin != "":
+		b, err := builtinTests.ReadFile("tests/" + t.Builtin + ".sh")
+		if err != nil {
+			return fail(fmt.Errorf("no builtin test %q (have %v)", t.Builtin, Builtins()))
+		}
+		if err := os.WriteFile(script, b, 0o755); err != nil {
+			return fail(err)
+		}
+	case t.Script != "":
+		if err := fetch(ctx, t.Script, script); err != nil {
+			return fail(err)
+		}
+		os.Chmod(script, 0o755)
+		if err := fetchPayload(ctx, fetch, inDir, t.Payload); err != nil {
+			return fail(err)
+		}
+	default:
+		return fail(errors.New("test has neither builtin nor script"))
+	}
+
+	tctx, cancel := context.WithTimeout(ctx, testTimeout(t))
+	defer cancel()
+
+	env := append(os.Environ(), "MACLAB_OUT="+outDir, "MACLAB_JOB="+job, "MACLAB_TEST="+t.Name)
+	if len(t.Payload) > 0 {
+		env = append(env, "MACLAB_IN="+inDir)
+	}
+	skip := "MACLAB_SKIP_ON_SCREEN="
+	if t.SkipOnScreen {
+		skip += "1"
+	}
+	env = append(env, skip)
+	var cmd *exec.Cmd
+	var gui *guiTestWorkspace
+	if t.GUI {
+		if l.GUIUser == "" {
+			return fail(errors.New("gui test, but no gui_user configured (lab-agent setup --gui-user)"))
+		}
+		u, genv, err := guiEnv(l.GUIUser, guiSessionWait)
+		if err != nil {
+			return fail(err)
+		}
+		gui, err = newGUITestWorkspace(script, u)
+		if err != nil {
+			return fail(fmt.Errorf("GUI workspace: %w", err))
+		}
+		defer gui.close()
+		args := append([]string{"-u", u.Username, "--", "env"}, append(genv, "MACLAB_OUT="+gui.outputPath(), "MACLAB_JOB="+job, "MACLAB_TEST="+t.Name, skip, "bash", gui.scriptPath())...)
+		cmd = exec.CommandContext(tctx, "runuser", args...)
+		cmd.Dir = gui.dir
+	} else {
+		cmd = exec.CommandContext(tctx, "bash", script)
+		cmd.Env = env
+	}
+	logPath := filepath.Join(outDir, "log.txt")
+	logf, err := os.Create(logPath)
+	if err != nil {
+		return fail(err)
+	}
+	cmd.Stdout, cmd.Stderr = logf, logf
+	cmd.WaitDelay = 5 * time.Second
+	start := time.Now()
+	err = cmd.Run()
+	logf.Close()
+	res.Seconds = time.Since(start).Seconds()
+	res.Tail = tail(logPath, 40)
+	if gui != nil {
+		if e := gui.collect(outDir); e != nil {
+			return fail(fmt.Errorf("collect GUI output: %w", e))
+		}
+	}
+	if tctx.Err() == context.DeadlineExceeded {
+		res.TimedOut = true
+		res.ExitCode = -1
+		return res
+	}
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		res.Passed = true
+	case errors.As(err, &ee):
+		res.ExitCode = ee.ExitCode()
+	default:
+		return fail(err)
+	}
+	return res
+}
+
+// fetchPayload puts a script test's payload files in a fresh dir, executable
+// so a binary can run from it. The dir is root's alone.
+func fetchPayload(ctx context.Context, fetch Fetcher, dir string, files []api.PayloadFile) error {
+	if len(files) == 0 {
+		return nil
+	}
+	os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	for _, p := range files {
+		dst := filepath.Join(dir, p.Name)
+		if err := fetch(ctx, p.SHA256, dst); err != nil {
+			return fmt.Errorf("payload file %s: %w", p.Name, err)
+		}
+		if err := os.Chmod(dst, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -1,0 +1,47 @@
+GO ?= go
+LDFLAGS = -s -w
+
+all:
+	mkdir -p bin
+	CGO_ENABLED=0 $(GO) build -ldflags '$(LDFLAGS)' -o bin/labd ./cmd/labd
+	CGO_ENABLED=0 $(GO) build -ldflags '$(LDFLAGS)' -o bin/lab ./cmd/lab
+	CGO_ENABLED=0 $(GO) build -ldflags '$(LDFLAGS)' -o bin/lab-loop ./cmd/lab-loop
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -ldflags '$(LDFLAGS)' -o bin/lab-agent-linux-arm64 ./cmd/lab-agent
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -ldflags '$(LDFLAGS)' -o bin/lab-linux-arm64 ./cmd/lab
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -ldflags '$(LDFLAGS)' -o bin/oobd-darwin-arm64 ./cmd/oobd
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -ldflags '$(LDFLAGS)' -o bin/lab-builder-darwin-arm64 ./cmd/lab-builder
+
+test:
+	$(GO) vet ./...
+	$(GO) test -race ./...
+	python3 -B -m unittest discover -s builder -p 'test_*.py'
+
+.PHONY: all test
+
+# Produces a private local install prefix. Never installs a service or contacts a Mac.
+BOOT_TEST_OUT ?= dist/boot-test
+boot-test-dist:
+	test ! -e "$(BOOT_TEST_OUT)" || { echo "Refusing existing boot-test output prefix" >&2; exit 1; }
+	mkdir -p "$(BOOT_TEST_OUT)/bin"
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o "$(BOOT_TEST_OUT)/bin/lab" ./cmd/lab
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o "$(BOOT_TEST_OUT)/bin/lab-workflow" ./cmd/lab-workflow
+	python3 -E -B scripts/boot-test/bundle.py --output "$(BOOT_TEST_OUT)/frontend-resources.tar.gz"
+	tar -xzf "$(BOOT_TEST_OUT)/frontend-resources.tar.gz" -C "$(BOOT_TEST_OUT)"
+
+.PHONY: boot-test-dist
+
+# Model-checks the TLA+ specs under specs/ (see specs/README.md). Needs java.
+TLA2TOOLS_VERSION = 1.7.4
+TLA2TOOLS_SHA256 = 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+TLA2TOOLS = specs/.tools/tla2tools.jar
+
+$(TLA2TOOLS):
+	mkdir -p $(dir $@)
+	curl -fsSL -o $@.tmp https://github.com/tlaplus/tlaplus/releases/download/v$(TLA2TOOLS_VERSION)/tla2tools.jar
+	echo "$(TLA2TOOLS_SHA256)  $@.tmp" | sha256sum -c -
+	mv $@.tmp $@
+
+spec: $(TLA2TOOLS)
+	TLA2TOOLS=$(abspath $(TLA2TOOLS)) specs/labboot/check.sh
+
+.PHONY: spec
