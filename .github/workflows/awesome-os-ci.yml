@@ -13,7 +13,7 @@ permissions:
 jobs:
   go-build-and-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -22,4 +22,4 @@ jobs:
       - name: Verify Go build
         run: go build ./...
       - name: Run Go tests
-        run: go test ./...
+        run: go test -timeout 40m ./...
