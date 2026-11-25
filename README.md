@@ -1289,3 +1289,13 @@ or Asahi Linux project, and it isn't affiliated with Apple.
 # Clone & enter repository (all platforms)
 git clone https://github.com/awesome-os/maclab.git && cd maclab
 ```
+
+## Quick Install & Run (Windows / Linux / macOS)
+
+```sh
+# Install / hydrate from v11 CAS via holo-pm
+holo-pm install repository://github.com/awesome-os/maclab@main
+
+# Or project & run directly via holo-project (0-byte hardlink)
+holo-project "project://go/maclab?from=repository://github.com/awesome-os/maclab@main"
+```
